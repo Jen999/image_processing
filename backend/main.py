@@ -6,6 +6,7 @@ import io
 import cv2
 import numpy as np
 import os
+import requests
 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -36,6 +37,10 @@ model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True)
 processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
 print("Model loaded successfully!")
 
+# DeepSeek API Configurations
+DEEPSEEK_API_URL = "https://api.deepseek.com"
+DEEPSEEK_API_KEY = "sk-4e6b88d828b9485a945929f9873b5584"
+
 
 # Step 3: Function to process image and generate OCR text
 def generate_ocr(image: Image.Image, task_prompt: str, max_new_tokens=512):
@@ -58,6 +63,31 @@ def generate_ocr(image: Image.Image, task_prompt: str, max_new_tokens=512):
     return processor.post_process_generation(
         generated_text, task=task_prompt, image_size=image.size
     )
+
+    # DeepSeek API
+    # # Convert image to bytes
+    # img_byte_arr = io.BytesIO()
+    # image.save(img_byte_arr, format="PNG")
+    # img_byte_arr = img_byte_arr.getvalue()
+
+    # # Prepare the request payload
+    # headers = {
+    #     "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+    #     "Content-Type": "application/octet-stream",
+    # }
+    # params = {"task_prompt": task_prompt}
+
+    # # Make the request to DeepSeek API
+    # response = requests.post(
+    #     DEEPSEEK_API_URL, headers=headers, params=params, data=img_byte_arr
+    # )
+
+    # if response.status_code == 200:
+    #     return response.json()
+    # else:
+    #     raise Exception(
+    #         f"DeepSeek API request failed with status code {response.status_code}: {response.text}"
+    #     )
 
 
 # Step 4: Function to draw bounding boxes
