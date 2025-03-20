@@ -39,7 +39,7 @@ print("Model loaded successfully!")
 
 # DeepSeek API Configurations
 DEEPSEEK_API_URL = "https://api.deepseek.com"
-DEEPSEEK_API_KEY = "sk-4e6b88d828b9485a945929f9873b5584"
+# DEEPSEEK_API_KEY =
 
 
 # Step 3: Function to process image and generate OCR text
