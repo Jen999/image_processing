@@ -1,5 +1,7 @@
 from fastapi import FastAPI, File, UploadFile, Form
 from transformers import AutoProcessor, AutoModelForCausalLM
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
 from PIL import Image
 import torch
 import io
@@ -12,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 
-# Step 1: Initialize FastAPI app
+# Initialize FastAPI app
 app = FastAPI()
 
 # Serve the `backend/static/` folder at `/static`
@@ -26,25 +28,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Step 2: Load Florence-2 Model ONCE at startup
-model_name = "microsoft/Florence-2-large"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Load Florence-2 Model ONCE at startup
+florence_model_name = "microsoft/Florence-2-large"
 print("Loading Florence-2 model... (this may take time)")
-model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True).to(
-    device
+florence_model = AutoModelForCausalLM.from_pretrained(
+    florence_model_name, trust_remote_code=True
+).to(device)
+florence_processor = AutoProcessor.from_pretrained(
+    florence_model_name, trust_remote_code=True, use_fast=True
 )
-processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-print("Model loaded successfully!")
+print("Florence Model loaded successfully!")
 
-# DeepSeek API Configurations
-DEEPSEEK_API_URL = "https://api.deepseek.com"
-# DEEPSEEK_API_KEY =
+# Load Qwen-2.5 Model
+qwen_model_name = "Qwen/Qwen2.5-VL-7B-Instruct"
+print("Loading Qwen-2.5 model... (this may take some time)")
+qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    qwen_model_name, torch_dtype="auto", device_map="auto"
+)
+qwen_processor = AutoProcessor.from_pretrained(qwen_model_name, use_fast=True)
+print("Qwen Model loaded successfully!")
 
 
-# Step 3: Function to process image and generate OCR text
-def generate_ocr(image: Image.Image, task_prompt: str, max_new_tokens=512):
-    print(f"Processing image with prompt: {task_prompt}")
+# Function to process image and generate OCR text using Florence-2 model
+def generate_florence(
+    image: Image.Image, task_prompt: str, model, processor, max_new_tokens=512
+):
+    print(f"Processing image with prompt using Florence-2: {task_prompt}")
 
     # Convert image and prompt into tensors
     inputs = processor(images=image, text=task_prompt, return_tensors="pt").to(device)
@@ -64,33 +75,58 @@ def generate_ocr(image: Image.Image, task_prompt: str, max_new_tokens=512):
         generated_text, task=task_prompt, image_size=image.size
     )
 
-    # DeepSeek API
-    # # Convert image to bytes
-    # img_byte_arr = io.BytesIO()
-    # image.save(img_byte_arr, format="PNG")
-    # img_byte_arr = img_byte_arr.getvalue()
 
-    # # Prepare the request payload
-    # headers = {
-    #     "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-    #     "Content-Type": "application/octet-stream",
-    # }
-    # params = {"task_prompt": task_prompt}
+# Function to process image with custom prompt and generate OCR text using Qwen-2.5 model
+def generate_qwen(
+    image: Image.Image, task_prompt: str, model, processor, max_new_tokens=128
+):
+    print(f"Processing image with prompt using Qwen-2.5: {task_prompt}")
 
-    # # Make the request to DeepSeek API
-    # response = requests.post(
-    #     DEEPSEEK_API_URL, headers=headers, params=params, data=img_byte_arr
-    # )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "image": image,
+                },
+                {"type": "text", "text": task_prompt},
+            ],
+        }
+    ]
 
-    # if response.status_code == 200:
-    #     return response.json()
-    # else:
-    #     raise Exception(
-    #         f"DeepSeek API request failed with status code {response.status_code}: {response.text}"
-    #     )
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+    inputs = inputs.to(model.device)
+
+    # Inference: Generation of the output
+    generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+
+    # Trim input tokens from output
+    generated_ids_trimmed = [
+        out_ids[len(in_ids) :]
+        for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    ]
+
+    # Decode final text
+    output_text = processor.batch_decode(
+        generated_ids_trimmed,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+    return output_text[0] if output_text else ""
 
 
-# Step 4: Function to draw bounding boxes
+# Function to draw bounding boxes (for OCR with region)
 def draw_bounding_boxes(image_bytes, ocr_result):
     print("Drawing bounding boxes on detected text regions...")
 
@@ -141,46 +177,58 @@ def draw_bounding_boxes(image_bytes, ocr_result):
     return f"static/{output_filename}"
 
 
-# Step 5: API Endpoint to Handle OCR Requests
+# API Endpoint to Handle OCR Requests
 @app.post("/ocr")
-async def process_ocr(image: UploadFile = File(...), prompt: str = Form(...)):
-    print("Received OCR request...")
+async def process_ocr(
+    image: UploadFile = File(...),
+    prompt: str = Form(...),
+    model: str = Form("florence"),
+):
+    print(f"Received OCR request using model: {model} with prompt: {prompt}")
 
     # Read and process the image
     image_bytes = await image.read()
     image = Image.open(io.BytesIO(image_bytes))
 
-    # Perform OCR
-    ocr_result = generate_ocr(image, prompt)
-
-    # If the user requests region-based OCR, include bounding boxes
-    if prompt == "<OCR>":
-        extracted_text = ocr_result.get("<OCR>", "")
-        return {"ocrText": extracted_text}
-
-    if prompt == "<OCR_WITH_REGION>":
-        extracted_text = ocr_result.get("<OCR_WITH_REGION>", "")
-        bbox_image_path = draw_bounding_boxes(
-            image_bytes, ocr_result["<OCR_WITH_REGION>"]
+    # Check model to use for OCR
+    if model == "florence":
+        ocr_result = generate_florence(
+            image, prompt, florence_model, florence_processor
         )
-        labels = ocr_result["<OCR_WITH_REGION>"].get("labels", [])
 
-        return {
-            "ocrText": extracted_text,
-            "annotatedImage": bbox_image_path,
-            "labels": labels,
-        }
+        if prompt == "<OCR>":
+            extracted_text = ocr_result.get("<OCR>", "")
+            return {"ocrText": extracted_text}
 
-    if prompt == "<CAPTION>":
-        extracted_text = ocr_result.get("<CAPTION>", "")
-        return {"ocrText": extracted_text}
+        # If the user requests region-based OCR, include bounding boxes
+        elif prompt == "<OCR_WITH_REGION>":
+            extracted_text = ocr_result.get("<OCR_WITH_REGION>", "")
+            bbox_image_path = draw_bounding_boxes(
+                image_bytes, ocr_result["<OCR_WITH_REGION>"]
+            )
+            labels = ocr_result["<OCR_WITH_REGION>"].get("labels", [])
 
-    if prompt == "<DETAILED_CAPTION>":
-        extracted_text = ocr_result.get("<DETAILED_CAPTION>", "")
-        return {"ocrText": extracted_text}
+            return {
+                "ocrText": extracted_text,
+                "annotatedImage": bbox_image_path,
+                "labels": labels,
+            }
 
-    if prompt == "<MORE_DETAILED_CAPTION>":
-        extracted_text = ocr_result.get("<MORE_DETAILED_CAPTION>", "")
-        return {"ocrText": extracted_text}
+        elif prompt == "<CAPTION>":
+            extracted_text = ocr_result.get("<CAPTION>", "")
+            return {"ocrText": extracted_text}
 
-    return
+        elif prompt == "<DETAILED_CAPTION>":
+            extracted_text = ocr_result.get("<DETAILED_CAPTION>", "")
+            return {"ocrText": extracted_text}
+
+        elif prompt == "<MORE_DETAILED_CAPTION>":
+            extracted_text = ocr_result.get("<MORE_DETAILED_CAPTION>", "")
+            return {"ocrText": extracted_text}
+
+        else:
+            return {"ocrText": ocr_result}
+
+    else:
+        ocr_result = generate_qwen(image, prompt, qwen_model, qwen_processor)
+        return {"ocrText": ocr_result}
